@@ -1,0 +1,31 @@
+{
+  "name": "obsidian-engram",
+  "version": "1.0.0",
+  "description": "Full-text search, semantic search, and knowledge graph for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "search",
+    "fts5",
+    "semantic",
+    "knowledge-graph"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/sql.js": "^1.4.9",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "sql.js-fts5": "^1.4.0",
+    "vis-data": "^7.1.9",
+    "vis-network": "^9.1.9"
+  }
+}
