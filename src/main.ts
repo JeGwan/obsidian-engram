@@ -65,11 +65,48 @@ export default class EngramPlugin extends Plugin {
       name: 'Search',
       callback: () => {
         this.activateView();
-        // Focus on keyword tab after opening
         const view = this.getView();
         if (view) {
           (view as any).switchTab('keyword');
         }
+      },
+    });
+
+    this.addCommand({
+      id: 'run-embedding',
+      name: 'Run Embedding',
+      callback: async () => {
+        if (!this.engine) return;
+        new Notice('Engram: Embedding started — check Dashboard for progress');
+        try {
+          const result = await this.engine.runEmbedding(false);
+          new Notice(`Engram: Embedded ${result.embedded} files (${result.errors} errors) in ${Math.round(result.durationMs / 1000)}s`);
+          this.refreshViews();
+        } catch (e: any) {
+          new Notice(`Engram: Embedding failed — ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'extract-graph',
+      name: 'Extract Graph',
+      callback: () => {
+        if (!this.engine) return;
+        new Notice('Engram: Extracting graph...');
+        const result = this.engine.runGraphExtraction();
+        new Notice(`Engram: ${result.filesProcessed} files → ${result.entitiesDiscovered} entities, ${result.relationships} rels, ${result.facts} facts (${result.durationMs}ms)`);
+        this.refreshViews();
+      },
+    });
+
+    this.addCommand({
+      id: 'load-vectors',
+      name: 'Load Vectors',
+      callback: () => {
+        if (!this.engine) return;
+        const count = this.engine.loadVectorCache();
+        new Notice(`Engram: Loaded ${count} vectors`);
       },
     });
 

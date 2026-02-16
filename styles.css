@@ -112,6 +112,91 @@
 }
 
 /* ── Distribution Bar ── */
+/* ── Action Cards ── */
+.engram-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.engram-action-card {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.engram-action-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.engram-action-icon {
+  font-size: 22px;
+  flex-shrink: 0;
+}
+
+.engram-action-title-area {
+  flex: 1;
+  min-width: 0;
+}
+
+.engram-action-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-normal);
+}
+
+.engram-action-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+
+.engram-action-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  min-height: 14px;
+}
+
+/* ── Progress Bar ── */
+.engram-progress-wrapper {
+  height: 4px;
+  background: var(--background-modifier-border);
+  border-radius: 2px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+
+.engram-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--interactive-accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.engram-progress-indeterminate {
+  width: 100% !important;
+  animation: engram-indeterminate 1.5s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--interactive-accent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+}
+
+@keyframes engram-indeterminate {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* ── Distribution ── */
 .engram-distribution {
   display: flex;
   flex-direction: column;

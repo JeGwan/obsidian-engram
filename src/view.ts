@@ -129,7 +129,7 @@ export class EngramView extends ItemView {
 
     switch (this.activeTab) {
       case 'dashboard':
-        this.currentRenderer = new DashboardRenderer(engine);
+        this.currentRenderer = new DashboardRenderer(engine, () => this.renderActiveTab());
         break;
       case 'keyword':
         this.currentRenderer = new KeywordSearchRenderer(engine, this.app);
