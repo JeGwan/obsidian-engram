@@ -25066,6 +25066,121 @@ function safeJsonParse3(str, fallback) {
   }
 }
 
+// ../core/build/search/hybrid.js
+function hybridSearch(db, vectors, queryEmbedding, query, limit = 10, k = 60, options = {}) {
+  const candidate = limit * 3;
+  const { directory, tag, since, until } = options;
+  let ftsSql = `
+    SELECT f.path, f.title,
+           snippet(files_fts, 1, '<mark>', '</mark>', '...', 40) as snippet
+     FROM files_fts fts
+     JOIN files f ON f.id = fts.rowid
+     WHERE files_fts MATCH ?
+  `;
+  const ftsParams = [query];
+  if (directory) {
+    ftsSql += " AND f.directory = ?";
+    ftsParams.push(directory);
+  }
+  if (tag) {
+    ftsSql += " AND f.tags LIKE ?";
+    ftsParams.push(`%${tag}%`);
+  }
+  if (since != null) {
+    ftsSql += " AND f.modified_at >= ?";
+    ftsParams.push(since);
+  }
+  if (until != null) {
+    ftsSql += " AND f.modified_at <= ?";
+    ftsParams.push(until);
+  }
+  ftsSql += " ORDER BY rank LIMIT ?";
+  ftsParams.push(candidate);
+  const ftsRows = db.queryAll(ftsSql, ftsParams);
+  const vecResults = searchVectors(vectors, queryEmbedding, candidate);
+  const bestVecByFile = /* @__PURE__ */ new Map();
+  for (const r of vecResults) {
+    const existing = bestVecByFile.get(r.fileId);
+    if (!existing || r.score > existing.score) {
+      bestVecByFile.set(r.fileId, { heading: r.heading, score: r.score });
+    }
+  }
+  const vecFiles = [];
+  for (const [fileId, { heading }] of bestVecByFile) {
+    const file = db.queryOne("SELECT path, title, directory, tags, modified_at FROM files WHERE id = ?", [fileId]);
+    if (!file)
+      continue;
+    if (directory && file.directory !== directory)
+      continue;
+    if (tag && !(file.tags ?? "").includes(tag))
+      continue;
+    if (since != null && file.modified_at < since)
+      continue;
+    if (until != null && file.modified_at > until)
+      continue;
+    vecFiles.push({ fileId, path: file.path, title: file.title, heading });
+  }
+  const acc = /* @__PURE__ */ new Map();
+  ftsRows.forEach((row, idx) => {
+    const rank = idx + 1;
+    const score = 1 / (k + rank);
+    const existing = acc.get(row.path);
+    if (existing) {
+      existing.rrfScore += score;
+      existing.ftsRank = rank;
+      if (!existing.snippet)
+        existing.snippet = row.snippet ?? null;
+    } else {
+      acc.set(row.path, {
+        path: row.path,
+        title: row.title,
+        snippet: row.snippet ?? null,
+        heading: null,
+        rrfScore: score,
+        ftsRank: rank,
+        vecRank: null
+      });
+    }
+  });
+  vecFiles.forEach((row, idx) => {
+    const rank = idx + 1;
+    const score = 1 / (k + rank);
+    const existing = acc.get(row.path);
+    if (existing) {
+      existing.rrfScore += score;
+      existing.vecRank = rank;
+      if (!existing.heading)
+        existing.heading = row.heading || null;
+    } else {
+      acc.set(row.path, {
+        path: row.path,
+        title: row.title,
+        snippet: null,
+        heading: row.heading || null,
+        rrfScore: score,
+        ftsRank: null,
+        vecRank: rank
+      });
+    }
+  });
+  const queryLower = query.toLowerCase();
+  for (const entry of acc.values()) {
+    if (entry.title.toLowerCase() === queryLower) {
+      entry.rrfScore += 1 / k;
+    }
+  }
+  return Array.from(acc.values()).sort((a, b) => b.rrfScore - a.rrfScore).slice(0, limit).map(({ path, title, snippet, heading, rrfScore, ftsRank, vecRank }) => ({
+    path,
+    title,
+    snippet,
+    heading,
+    rrfScore,
+    ftsRank,
+    vecRank,
+    sources: ftsRank !== null && vecRank !== null ? "both" : ftsRank !== null ? "fts" : "vec"
+  }));
+}
+
 // ../core/build/stats.js
 function getVaultStats(db) {
   const files = db.queryOne("SELECT COUNT(*) as c FROM files")?.c ?? 0;
@@ -25259,7 +25374,9 @@ var DEFAULT_SETTINGS = {
   embeddingEnabled: false,
   graphExtractionEnabled: false,
   skipDirectories: ["node_modules", ".git"],
-  peopleDir: ""
+  peopleDir: "",
+  vectorLoadMode: "auto",
+  vectorAutoLoadThresholdMB: 100
 };
 var EngramEngine = class {
   constructor(db, vault, settings) {
@@ -25393,6 +25510,16 @@ var EngramEngine = class {
       };
     });
   }
+  async hybridSearch(query, topK = 10, options = {}) {
+    if (this.vectors.length === 0) {
+      throw new Error("No vectors loaded. Run embedding first, then load vectors.");
+    }
+    if (!await this.isOllamaAvailable()) {
+      throw new Error("Ollama is not running. Start Ollama to use hybrid search.");
+    }
+    const queryVec = await embed(query, this.settings.ollamaUrl, this.settings.ollamaModel);
+    return hybridSearch(this.db, this.vectors, queryVec, query, topK, 60, options);
+  }
   async isOllamaAvailable() {
     return isOllamaRunning(this.settings.ollamaUrl);
   }
@@ -25402,6 +25529,22 @@ var EngramEngine = class {
   }
   getVectorCount() {
     return this.vectors.length;
+  }
+  /** DB에 저장된 embedding 데이터의 총 바이트 수 */
+  getVectorDataSizeBytes() {
+    const row = this.db.queryOne(
+      "SELECT SUM(LENGTH(embedding)) as total FROM embeddings WHERE embedding IS NOT NULL"
+    );
+    return row?.total ?? 0;
+  }
+  /** 벡터를 자동 로드해야 하는지 판단 */
+  shouldAutoLoadVectors() {
+    const mode = this.settings.vectorLoadMode;
+    if (mode === "always") return true;
+    if (mode === "never") return false;
+    const sizeBytes = this.getVectorDataSizeBytes();
+    const thresholdBytes = this.settings.vectorAutoLoadThresholdMB * 1024 * 1024;
+    return sizeBytes <= thresholdBytes;
   }
   async runEmbedding(force = false, onProgress) {
     const { result, vectors } = await runEmbedIndex(
@@ -25870,76 +26013,13 @@ var DashboardRenderer = class extends BaseRenderer {
   }
 };
 
-// src/ui/keyword-search.ts
-var KeywordSearchRenderer = class extends BaseRenderer {
-  resultsContainer = null;
-  currentDirectory = "";
-  app;
-  constructor(engine, app) {
-    super(engine);
-    this.app = app;
-  }
-  render(container) {
-    this.container = container;
-    container.empty();
-    const controls = el("div", { class: "engram-search-controls" });
-    controls.appendChild(createSearchInput("Search vault (FTS5)...", (q) => this.doSearch(q)));
-    const stats = this.engine.getStats();
-    const dirs = ["", ...stats.directories.map((d) => d.name)];
-    const select = createSelect(dirs, (dir) => {
-      this.currentDirectory = dir;
-    });
-    controls.appendChild(select);
-    container.appendChild(controls);
-    this.resultsContainer = el("div", { class: "engram-results" });
-    this.resultsContainer.appendChild(createEmptyState("Type a query to search..."));
-    container.appendChild(this.resultsContainer);
-  }
-  doSearch(query) {
-    if (!this.resultsContainer) return;
-    this.resultsContainer.empty();
-    if (!query) {
-      this.resultsContainer.appendChild(createEmptyState("Type a query to search..."));
-      return;
-    }
-    try {
-      const results = this.engine.search(query, {
-        directory: this.currentDirectory || void 0
-      });
-      if (results.length === 0) {
-        this.resultsContainer.appendChild(createEmptyState(`No results for "${query}"`));
-        return;
-      }
-      for (const r of results) {
-        this.resultsContainer.appendChild(
-          createResultCard({
-            title: r.title,
-            path: r.path,
-            snippet: r.snippet,
-            tags: r.tags,
-            onClick: () => {
-              const file = this.app.vault.getAbstractFileByPath(r.path);
-              if (file) {
-                this.app.workspace.openLinkText(r.path, "", false);
-              }
-            }
-          })
-        );
-      }
-    } catch (err) {
-      this.resultsContainer.appendChild(createEmptyState(`Search error: ${err.message}`));
-    }
-  }
-  destroy() {
-    this.resultsContainer = null;
-    super.destroy();
-  }
-};
-
-// src/ui/semantic-search.ts
-var SemanticSearchRenderer = class extends BaseRenderer {
+// src/ui/search.ts
+var SearchRenderer = class extends BaseRenderer {
   resultsContainer = null;
   statusEl = null;
+  currentMode = "hybrid";
+  currentDirectory = "";
+  lastQuery = "";
   app;
   constructor(engine, app) {
     super(engine);
@@ -25951,17 +26031,84 @@ var SemanticSearchRenderer = class extends BaseRenderer {
     this.statusEl = el("div", { class: "engram-semantic-status" });
     this.updateStatus();
     container.appendChild(this.statusEl);
-    container.appendChild(createSearchInput("Semantic search...", (q) => this.doSearch(q)));
+    const modeBar = el("div", { class: "engram-mode-bar" });
+    const modes = [
+      { id: "hybrid", label: "Hybrid", icon: "\u26A1" },
+      { id: "keyword", label: "Keyword", icon: "\u{1F50D}" },
+      { id: "semantic", label: "Semantic", icon: "\u{1F9E0}" }
+    ];
+    for (const mode of modes) {
+      const btn = el("button", {
+        class: `engram-mode-btn ${mode.id === this.currentMode ? "engram-mode-active" : ""}`
+      });
+      btn.dataset.mode = mode.id;
+      btn.appendChild(el("span", { text: mode.icon }));
+      btn.appendChild(el("span", { text: ` ${mode.label}` }));
+      btn.addEventListener("click", () => this.switchMode(mode.id));
+      modeBar.appendChild(btn);
+    }
+    container.appendChild(modeBar);
+    const controls = el("div", { class: "engram-search-controls" });
+    controls.appendChild(createSearchInput(this.getPlaceholder(), (q) => this.doSearch(q)));
+    const stats = this.engine.getStats();
+    const dirs = ["", ...stats.directories.map((d) => d.name)];
+    controls.appendChild(createSelect(dirs, (dir) => {
+      this.currentDirectory = dir;
+    }));
+    container.appendChild(controls);
     this.resultsContainer = el("div", { class: "engram-results" });
-    this.resultsContainer.appendChild(createEmptyState("Enter a query for semantic similarity search"));
+    this.resultsContainer.appendChild(createEmptyState(this.getEmptyMessage()));
     container.appendChild(this.resultsContainer);
+  }
+  switchMode(mode) {
+    if (mode === this.currentMode) return;
+    this.currentMode = mode;
+    const bar = this.container?.querySelector(".engram-mode-bar");
+    if (bar) {
+      bar.querySelectorAll(".engram-mode-btn").forEach((btn) => {
+        const el2 = btn;
+        if (el2.dataset.mode === mode) {
+          el2.addClass("engram-mode-active");
+        } else {
+          el2.removeClass("engram-mode-active");
+        }
+      });
+    }
+    const input = this.container?.querySelector(".engram-search-input");
+    if (input) input.placeholder = this.getPlaceholder();
+    if (this.lastQuery) {
+      this.doSearch(this.lastQuery);
+    } else if (this.resultsContainer) {
+      this.resultsContainer.empty();
+      this.resultsContainer.appendChild(createEmptyState(this.getEmptyMessage()));
+    }
+  }
+  getPlaceholder() {
+    switch (this.currentMode) {
+      case "hybrid":
+        return "Hybrid search (FTS5 + Semantic)...";
+      case "keyword":
+        return "Keyword search (FTS5)...";
+      case "semantic":
+        return "Semantic search (Ollama)...";
+    }
+  }
+  getEmptyMessage() {
+    switch (this.currentMode) {
+      case "hybrid":
+        return "Combines keyword + semantic with RRF ranking";
+      case "keyword":
+        return "Full-text search powered by SQLite FTS5";
+      case "semantic":
+        return "Meaning-based search via Ollama embeddings";
+    }
   }
   async updateStatus() {
     if (!this.statusEl) return;
     this.statusEl.empty();
     const vectorCount = this.engine.getVectorCount();
     const available = await this.engine.isOllamaAvailable();
-    const statusText = available ? `Ollama connected | ${vectorCount} vectors loaded` : `Ollama not available | ${vectorCount} vectors loaded`;
+    const statusText = available ? `Ollama connected | ${vectorCount} vectors` : `Ollama not available | ${vectorCount} vectors`;
     const dot = el("span", {
       class: available ? "engram-status-dot engram-status-online" : "engram-status-dot engram-status-offline"
     });
@@ -25969,36 +26116,101 @@ var SemanticSearchRenderer = class extends BaseRenderer {
     this.statusEl.appendText(` ${statusText}`);
   }
   async doSearch(query) {
+    this.lastQuery = query;
     if (!this.resultsContainer) return;
     this.resultsContainer.empty();
     if (!query) {
-      this.resultsContainer.appendChild(createEmptyState("Enter a query for semantic similarity search"));
+      this.resultsContainer.appendChild(createEmptyState(this.getEmptyMessage()));
       return;
     }
     this.resultsContainer.appendChild(createLoadingSpinner());
     try {
-      const results = await this.engine.semanticSearch(query);
-      this.resultsContainer.empty();
-      if (results.length === 0) {
-        this.resultsContainer.appendChild(createEmptyState(`No semantic results for "${query}"`));
-        return;
-      }
-      for (const r of results) {
-        this.resultsContainer.appendChild(
-          createResultCard({
-            title: r.title,
-            path: r.path,
-            snippet: r.chunkText,
-            score: r.score,
-            onClick: () => {
-              this.app.workspace.openLinkText(r.path, "", false);
-            }
-          })
-        );
+      switch (this.currentMode) {
+        case "hybrid":
+          await this.searchHybrid(query);
+          break;
+        case "keyword":
+          this.searchKeyword(query);
+          break;
+        case "semantic":
+          await this.searchSemantic(query);
+          break;
       }
     } catch (err) {
       this.resultsContainer.empty();
       this.resultsContainer.appendChild(createEmptyState(`Error: ${err.message}`));
+    }
+  }
+  async searchHybrid(query) {
+    const results = await this.engine.hybridSearch(query, 20, {
+      directory: this.currentDirectory || void 0
+    });
+    this.resultsContainer.empty();
+    if (results.length === 0) {
+      this.resultsContainer.appendChild(createEmptyState(`No results for "${query}"`));
+      return;
+    }
+    for (const r of results) {
+      const card = createResultCard({
+        title: r.title,
+        path: r.path,
+        snippet: r.snippet ?? r.heading ?? void 0,
+        onClick: () => this.app.workspace.openLinkText(r.path, "", false)
+      });
+      const header = card.querySelector(".engram-result-header");
+      if (header) {
+        const badges = el("span", { class: "engram-result-badges" });
+        badges.appendChild(el("span", {
+          class: "engram-result-score",
+          text: r.rrfScore.toFixed(3)
+        }));
+        badges.appendChild(el("span", {
+          class: `engram-source-badge engram-source-${r.sources}`,
+          text: r.sources.toUpperCase()
+        }));
+        header.appendChild(badges);
+      }
+      this.resultsContainer.appendChild(card);
+    }
+  }
+  searchKeyword(query) {
+    const results = this.engine.search(query, {
+      directory: this.currentDirectory || void 0
+    });
+    this.resultsContainer.empty();
+    if (results.length === 0) {
+      this.resultsContainer.appendChild(createEmptyState(`No results for "${query}"`));
+      return;
+    }
+    for (const r of results) {
+      this.resultsContainer.appendChild(
+        createResultCard({
+          title: r.title,
+          path: r.path,
+          snippet: r.snippet,
+          tags: r.tags,
+          onClick: () => this.app.workspace.openLinkText(r.path, "", false)
+        })
+      );
+    }
+  }
+  async searchSemantic(query) {
+    const results = await this.engine.semanticSearch(query);
+    this.resultsContainer.empty();
+    if (results.length === 0) {
+      this.resultsContainer.appendChild(createEmptyState(`No semantic results for "${query}"`));
+      return;
+    }
+    for (const r of results) {
+      this.resultsContainer.appendChild(
+        createResultCard({
+          title: r.title,
+          path: r.path,
+          snippet: r.chunkText,
+          score: r.score,
+          onClick: () => this.app.workspace.openLinkText(r.path, "", false)
+        })
+      );
     }
   }
   destroy() {
@@ -26131,133 +26343,6 @@ var GraphViewRenderer = class extends BaseRenderer {
   }
 };
 
-// src/ui/db-explorer.ts
-var DbExplorerRenderer = class extends BaseRenderer {
-  contentArea = null;
-  selectedTable = "";
-  currentOffset = 0;
-  currentSort = "";
-  currentOrder = "ASC";
-  pageSize = 50;
-  render(container) {
-    this.container = container;
-    container.empty();
-    const tables = this.engine.getTables();
-    if (tables.length === 0) {
-      container.appendChild(createEmptyState("No tables found. Index your vault first."));
-      return;
-    }
-    const layout = el("div", { class: "engram-db-layout" });
-    const sidebar = el("div", { class: "engram-db-sidebar" });
-    sidebar.appendChild(el("h4", { text: "Tables" }));
-    for (const t of tables) {
-      const item = el("div", {
-        class: "engram-db-table-item",
-        text: `${t.name} (${t.rowCount})`
-      });
-      item.addEventListener("click", () => {
-        this.selectedTable = t.name;
-        this.currentOffset = 0;
-        this.currentSort = "";
-        sidebar.querySelectorAll(".engram-db-table-item").forEach(
-          (el2) => el2.removeClass("engram-db-table-active")
-        );
-        item.addClass("engram-db-table-active");
-        this.renderTable();
-      });
-      sidebar.appendChild(item);
-    }
-    layout.appendChild(sidebar);
-    this.contentArea = el("div", { class: "engram-db-content" });
-    this.contentArea.appendChild(createEmptyState("Select a table"));
-    layout.appendChild(this.contentArea);
-    container.appendChild(layout);
-  }
-  renderTable() {
-    if (!this.contentArea || !this.selectedTable) return;
-    this.contentArea.empty();
-    const data = this.engine.getTableRows(this.selectedTable, {
-      limit: this.pageSize,
-      offset: this.currentOffset,
-      sort: this.currentSort,
-      order: this.currentOrder
-    });
-    if (data.rows.length === 0) {
-      this.contentArea.appendChild(createEmptyState("No rows"));
-      return;
-    }
-    const paginationTop = el("div", { class: "engram-db-pagination" });
-    const from = this.currentOffset + 1;
-    const to = Math.min(this.currentOffset + this.pageSize, data.total);
-    paginationTop.appendChild(el("span", { text: `${from}-${to} of ${data.total}` }));
-    const btnGroup = el("div", { class: "engram-db-btn-group" });
-    if (this.currentOffset > 0) {
-      const prevBtn = el("button", { class: "engram-btn engram-btn-sm", text: "\u2190 Prev" });
-      prevBtn.addEventListener("click", () => {
-        this.currentOffset = Math.max(0, this.currentOffset - this.pageSize);
-        this.renderTable();
-      });
-      btnGroup.appendChild(prevBtn);
-    }
-    if (this.currentOffset + this.pageSize < data.total) {
-      const nextBtn = el("button", { class: "engram-btn engram-btn-sm", text: "Next \u2192" });
-      nextBtn.addEventListener("click", () => {
-        this.currentOffset += this.pageSize;
-        this.renderTable();
-      });
-      btnGroup.appendChild(nextBtn);
-    }
-    paginationTop.appendChild(btnGroup);
-    this.contentArea.appendChild(paginationTop);
-    const tableWrapper = el("div", { class: "engram-db-table-wrapper" });
-    const table = el("table", { class: "engram-db-table" });
-    const thead = el("thead");
-    const headerRow = el("tr");
-    for (const col of data.columns) {
-      const th = el("th", { text: col });
-      th.style.cursor = "pointer";
-      th.addEventListener("click", () => {
-        if (this.currentSort === col) {
-          this.currentOrder = this.currentOrder === "ASC" ? "desc" : "ASC";
-        } else {
-          this.currentSort = col;
-          this.currentOrder = "ASC";
-        }
-        this.currentOffset = 0;
-        this.renderTable();
-      });
-      if (this.currentSort === col) {
-        th.textContent += this.currentOrder === "ASC" ? " \u25B2" : " \u25BC";
-      }
-      headerRow.appendChild(th);
-    }
-    thead.appendChild(headerRow);
-    table.appendChild(thead);
-    const tbody = el("tbody");
-    for (const row of data.rows) {
-      const tr = el("tr");
-      for (const col of data.columns) {
-        const val = row[col];
-        const td = el("td");
-        td.textContent = val == null ? "NULL" : String(val);
-        if (typeof val === "string" && val.length > 100) {
-          td.title = val;
-          td.textContent = val.slice(0, 100) + "...";
-        }
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
-    }
-    table.appendChild(tbody);
-    tableWrapper.appendChild(table);
-    this.contentArea.appendChild(tableWrapper);
-  }
-  destroy() {
-    this.contentArea = null;
-    super.destroy();
-  }
-};
-
 // src/ui/command-palette.ts
 var CommandPalette = class {
   overlay = null;
@@ -26331,10 +26416,8 @@ var CommandPalette = class {
 var VIEW_TYPE_ENGRAM = "engram-view";
 var TABS = [
   { id: "dashboard", label: "Dashboard", icon: "\u{1F4CA}" },
-  { id: "keyword", label: "Keyword", icon: "\u{1F50D}" },
-  { id: "semantic", label: "Semantic", icon: "\u{1F9E0}" },
-  { id: "graph", label: "Graph", icon: "\u{1F578}" },
-  { id: "db-explorer", label: "DB Explorer", icon: "\u{1F5C4}" }
+  { id: "search", label: "Search", icon: "\u{1F50D}" },
+  { id: "graph", label: "Graph", icon: "\u{1F578}" }
 ];
 var EngramView = class extends import_obsidian2.ItemView {
   plugin;
@@ -26417,17 +26500,11 @@ var EngramView = class extends import_obsidian2.ItemView {
       case "dashboard":
         this.currentRenderer = new DashboardRenderer(engine, () => this.renderActiveTab());
         break;
-      case "keyword":
-        this.currentRenderer = new KeywordSearchRenderer(engine, this.app);
-        break;
-      case "semantic":
-        this.currentRenderer = new SemanticSearchRenderer(engine, this.app);
+      case "search":
+        this.currentRenderer = new SearchRenderer(engine, this.app);
         break;
       case "graph":
         this.currentRenderer = new GraphViewRenderer(engine);
-        break;
-      case "db-explorer":
-        this.currentRenderer = new DbExplorerRenderer(engine);
         break;
     }
     if (this.currentRenderer) {
@@ -26443,10 +26520,8 @@ var EngramView = class extends import_obsidian2.ItemView {
     if (!engine) return;
     this.palette.setCommands([
       { id: "dashboard", name: "Go to Dashboard", icon: "\u{1F4CA}", callback: () => this.switchTab("dashboard") },
-      { id: "keyword", name: "Keyword Search", icon: "\u{1F50D}", callback: () => this.switchTab("keyword") },
-      { id: "semantic", name: "Semantic Search", icon: "\u{1F9E0}", callback: () => this.switchTab("semantic") },
+      { id: "search", name: "Search", icon: "\u{1F50D}", callback: () => this.switchTab("search") },
       { id: "graph", name: "Knowledge Graph", icon: "\u{1F578}", callback: () => this.switchTab("graph") },
-      { id: "db-explorer", name: "DB Explorer", icon: "\u{1F5C4}", callback: () => this.switchTab("db-explorer") },
       {
         id: "reindex",
         name: "Reindex Vault",
@@ -26532,6 +26607,21 @@ var EngramSettingTab = class extends import_obsidian3.PluginSettingTab {
       (text) => text.setPlaceholder("bge-m3").setValue(this.plugin.settings.ollamaModel).onChange(async (value) => {
         this.plugin.settings.ollamaModel = value;
         await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Vector loading mode").setDesc("Controls when embedding vectors are loaded into memory at startup").addDropdown(
+      (dropdown) => dropdown.addOption("auto", "Auto (threshold-based)").addOption("always", "Always load").addOption("never", "Manual only").setValue(this.plugin.settings.vectorLoadMode).onChange(async (value) => {
+        this.plugin.settings.vectorLoadMode = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Auto-load threshold (MB)").setDesc("In auto mode, vectors are loaded at startup only if total size is below this threshold").addText(
+      (text) => text.setPlaceholder("100").setValue(String(this.plugin.settings.vectorAutoLoadThresholdMB)).onChange(async (value) => {
+        const num = parseInt(value, 10);
+        if (!isNaN(num) && num > 0) {
+          this.plugin.settings.vectorAutoLoadThresholdMB = num;
+          await this.plugin.saveSettings();
+        }
       })
     );
     containerEl.createEl("h3", { text: "Knowledge Graph" });
@@ -26651,7 +26741,7 @@ var EngramPlugin = class extends import_obsidian4.Plugin {
         this.activateView();
         const view = this.getView();
         if (view) {
-          view.switchTab("keyword");
+          view.switchTab("search");
         }
       }
     });
@@ -26727,7 +26817,7 @@ var EngramPlugin = class extends import_obsidian4.Plugin {
       if (this.settings.autoIndexOnStartup) {
         await this.engine.fullIndex();
       }
-      if (this.settings.embeddingEnabled) {
+      if (this.settings.embeddingEnabled && this.engine.shouldAutoLoadVectors()) {
         this.engine.loadVectorCache();
       }
       this.registerEvent(
