@@ -1,6 +1,7 @@
 node_modules/
-main.js
-sql-wasm.wasm
-*.js.map
-build/
-data/
+src/
+esbuild.config.mjs
+tsconfig.json
+package-lock.json
+CLAUDE.md
+.DS_Store
